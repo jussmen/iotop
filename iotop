@@ -1,0 +1,219 @@
+#!/usr/bin/python
+# coding: utf-8
+
+'''
+# iotop
+
+iotop command that can run on F5 BigIP. It lists the top 10 processes of Read and Write in the interval. The data sorce is, read_bytes and write_bytes in /proc/PID/io and /proc/PID/task/io.
+
+See man PROC(5) 
+http://man7.org/linux/man-pages/man5/proc.5.html
+
+# Problem that this script solves
+
+F5 BigIP does not have useful linux commands that make difficult to understand which process is writing/reading most
+
+# Options
+You do not need any argument or you can specify an interval
+
+-i / --interval : Specify interval in seconds. Default is 2 seconds
+
+# How to use
+1. Copy iotop to your BigIP, such as /shared/
+2. Give permission
+chmod +x /shared/iotop
+3. Run
+/shared/iotop
+
+
+Mar 06 2019
+Kimihito Tanaka - Sr.Enterprise Network Engineer@F5 Networks
+'''
+
+import os, sys, argparse, time, re
+from datetime import datetime
+
+ioFiles1 = []
+ioFileContent1 = {}
+ioFiles2 = []
+ioFileContent2 = {}
+deltaReadBytes = {}
+deltaWriteBytes = {}
+sortedDeltaRead = []
+sortedDeltaWrite = []
+
+def genIoFileList(ioFiles):
+	for p in os.listdir('/proc/'):
+		if p.isdigit():
+			pidIO = '/'.join(['/proc', p, 'io'])
+			if os.path.isfile(pidIO):
+				ioFiles.append(pidIO)
+			try:
+				for pp in os.listdir('/proc/' + p):
+					if pp == 'task':
+						pidTaskIO = '/'.join(['/proc', p, 'task', 'io'])
+						if os.path.isfile(pidTaskIO):
+							ioFiles.append(pidTaskIO)
+			except:
+				pass
+
+def readIoFile(ioFile, ioFileContent):
+	'''
+	rchar: 16944058954
+	wchar: 3994494100
+	syscr: 94815765
+	syscw: 15520585
+	read_bytes: 741108736
+	write_bytes: 8678486016
+	cancelled_write_bytes: 4398641152
+	'''
+	try:
+		f = open(ioFile, 'r')
+		tmp = f.readlines()[4:6] # Only read_bytes and write_bytes
+		tmp2 = [float(x.strip('\n').split(':')[1].strip(' ')) for x in tmp]
+		tmp3 = [ioFile]
+		tmp3.extend(tmp2)
+		pid = int(ioFile.split('/')[2])
+		f.close()
+
+		f = open('/proc/' + str(pid) + '/cmdline', 'r')
+		cmdline = [f.readline().split('\x00')[0]]
+		f.close()
+
+		if len(cmdline[0]) == 0:
+			f = open('/proc/' + str(pid) + '/status', 'r')
+			pname = f.readline().split(':')[1]
+			pname = re.sub(r' *', '', pname).strip('\t').strip('\n')
+			cmdline = [pname]
+		tmp3.extend(cmdline)
+		# { PID : ['/proc/PID/io', 'read_bytes', 'write_bytes', 'cmdline'], 
+		ioFileContent.update({pid:tmp3})
+	except Exception as e:
+		pass
+
+def calcDelta(op):
+	global deltaReadBytes
+	global deltaWriteBytes
+	deltaReadBytes.clear()
+	deltaWriteBytes.clear()
+
+
+	if op == '1-2':
+		for k,v in ioFileContent1.items():
+			try:
+				readDelta = v[1] - ioFileContent2[k][1] 
+				deltaReadBytes.update({ k:readDelta })
+				writeDelta = v[2] - ioFileContent2[k][2]
+				deltaWriteBytes.update({ k:writeDelta })
+			except Exception as e:
+				#print e
+				pass
+	elif op == '2-1':
+		for k,v in ioFileContent2.items():
+			try:
+				readDelta = v[1] - ioFileContent1[k][1]
+				deltaReadBytes.update({ k:readDelta })
+				writeDelta = v[2] - ioFileContent1[k][2]
+				deltaWriteBytes.update({ k:writeDelta })
+			except Exception as e:
+				#print e
+				pass
+
+	# [ (PID, byte), (PID, byte), ]
+	global sortedDeltaRead
+	global sortedDeltaWrite
+	sortedDeltaRead[:] = []
+	sortedDeltaWrite[:] = []
+
+	sortedDeltaRead = sorted(deltaReadBytes.items(), key=lambda x:x[1], reverse=True)
+	sortedDeltaWrite = sorted(deltaWriteBytes.items(), key=lambda x:x[1], reverse=True)
+	sortedDeltaRead = sortedDeltaRead[:10]
+	sortedDeltaWrite = sortedDeltaWrite[:10]
+
+	#print sortedDeltaRead
+	#print sortedDeltaWrite
+
+def runMonitor(interval):
+	cnt = 0 
+	while True:
+		if cnt == 0:
+			ioFiles1[:] = []
+			ioFileContent1.clear()
+			genIoFileList(ioFiles1)
+			for ioFile in ioFiles1:
+				readIoFile(ioFile, ioFileContent1)
+			time.sleep(interval)
+
+			ioFiles2[:] = []
+			ioFileContent2.clear()
+			genIoFileList(ioFiles2)
+			for ioFile in ioFiles2:
+				readIoFile(ioFile, ioFileContent2)
+			calcDelta('2-1')
+
+		elif cnt % 2 == 1:
+			time.sleep(interval)
+
+			ioFiles1[:] = []
+			ioFileContent1.clear()
+			genIoFileList(ioFiles1)
+			for ioFile in ioFiles1:
+				readIoFile(ioFile, ioFileContent1)
+
+			calcDelta('1-2')
+
+		else:
+			time.sleep(interval)
+
+			ioFiles2[:] = []
+			ioFileContent2.clear()
+			genIoFileList(ioFiles2)
+			for ioFile in ioFiles2:
+				readIoFile(ioFile, ioFileContent2)
+
+			calcDelta('2-1')
+
+		# Print
+		print(datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+		print('')
+		print('{0:<50}{1:<5}{2:>10}{3:<5}{4:<20}'.format('Readers', ' ', 'Delta Bytes', ' ', 'Source File'))
+		for i in range(10):
+			try:
+				pid = sortedDeltaRead[i][0]
+				deltaRead = sortedDeltaRead[i][1]
+				sourceFile = ioFileContent1[pid][0]
+				cmdline = ioFileContent1[pid][3]
+				print('{0:<50}{1:<5}{2:>10}{3:<5}{4:<20}'.format(cmdline,  ' ', deltaRead, ' ', sourceFile))
+			except:
+				pass
+		print('')
+		print('{0:<50}{1:<5}{2:>10}{3:<5}{4:<20}'.format('Writers', ' ', 'Delta Bytes', ' ', 'Source File'))
+		for i in range(10):
+			try:
+				pid = sortedDeltaWrite[i][0]
+				deltaWrite = sortedDeltaWrite[i][1]
+				sourceFile = ioFileContent1[pid][0]
+				cmdline = ioFileContent1[pid][3]
+				print('{0:<50}{1:<5}{2:>10}{3:<5}{4:<20}'.format(cmdline,  ' ', deltaWrite, ' ', sourceFile))
+			except Exception as e:
+				#print e
+				pass
+		print('-' * 100)
+		cnt += 1
+
+
+if __name__ == '__main__':
+	try:
+		parser = argparse.ArgumentParser(description='Display Top Processes for Read and Write')
+		parser.add_argument('-i', '--interval', nargs=1, type=float, help='Specify interval in seconds. Default is 2 seconds')
+		args = parser.parse_args()
+		if args.interval:
+			interval = args.interval[0]
+		else:
+			interval = 2
+		runMonitor(interval)
+
+	except (KeyboardInterrupt, IOError): 
+		sys.stderr.close()
+		sys.exit()  
+
